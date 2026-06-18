@@ -1,0 +1,17 @@
+[project]
+name = "sports-analytics-agent"
+version = "0.1.0"
+description = "Serverless headless agent that turns a Blob-hosted match-statistics CSV into an HTML insights dashboard, analysing it with pandas in a persistent Azure Container Apps sandbox"
+requires-python = ">=3.11"
+dependencies = [
+    "azurefunctions-agents-runtime",
+    # Stateful Container Apps Sandboxes SDK (preview). The exact pinned pre-release
+    # installs without needing the --pre flag.
+    "azure-containerapps-sandbox==0.1.0b2",
+    "azure-identity>=1.15",
+    "azure-storage-blob>=12.20",
+]
+
+# This is an Azure Functions app, not an installable library, so don't build it as a package.
+[tool.uv]
+package = false

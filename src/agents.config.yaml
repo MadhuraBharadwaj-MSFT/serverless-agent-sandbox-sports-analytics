@@ -1,0 +1,15 @@
+# Global configuration for all agents in this function app.
+#
+# This app does NOT use the dynamic_sessions_code_interpreter system tool. Data
+# analysis is handled by a single custom tool in src/tools/ that keeps ONE
+# persistent, stateful Container Apps sandbox warm across timer runs (the data
+# stack is installed once and the loaded DataFrame survives between run_analysis
+# calls). That one tool, run_analysis, also reads the input CSV from Blob Storage
+# on first use and writes the HTML dashboard back to Blob Storage when the agent
+# saves its narrative (shared logic in _analyst_common.py).
+#
+# timeout is generous because a run loads data, iterates on analysis, renders a
+# chart, and publishes a dashboard in a single headless invocation.
+
+model: $FOUNDRY_MODEL
+timeout: 1800

@@ -1,0 +1,19 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "AZURE_FUNCTIONS_AGENTS_PROVIDER": "foundry",
+    "FOUNDRY_PROJECT_ENDPOINT": "",
+    "FOUNDRY_MODEL": "gpt-4.1",
+    "AZURE_CLIENT_ID": "",
+    "SANDBOX_REGION": "eastus2",
+    "SANDBOX_SUBSCRIPTION_ID": "",
+    "SANDBOX_RESOURCE_GROUP": "",
+    "SANDBOX_GROUP_NAME": "",
+    "DATA_BLOB_ENDPOINT": "",
+    "DATA_INPUT_CONTAINER": "input",
+    "DATA_OUTPUT_CONTAINER": "output",
+    "INPUT_BLOB_NAME": "matches.csv"
+  }
+}

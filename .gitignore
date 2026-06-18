@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Azure Functions
+local.settings.json
+bin/
+obj/
+.python_packages/
+
+# azd
+.azure/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+
+# Local-only working notes (not for publication)
+considerations.md
+
+# Local demo artifacts downloaded from the output container
+demo-output/
