@@ -53,8 +53,10 @@ SandboxGroup Data Owner" on the sandbox group (both granted in infra/).
 from __future__ import annotations
 
 import base64
+import contextvars
 import logging
 import os
+import time
 
 from azure.identity import DefaultAzureCredential
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
@@ -62,6 +64,34 @@ from azure.storage.blob import BlobServiceClient, ContentSettings
 from azure.containerapps.sandbox import SandboxGroupClient, endpoint_for_region
 
 logger = logging.getLogger("sports_analytics.sandbox")
+
+# Logs emitted from inside a tool call do not reach Application Insights: the
+# Functions host only captures logs bound to the active invocation context, and
+# the tool body runs off that context (under ``asyncio.to_thread``). So every
+# sandbox-lifecycle event is ALSO appended to a per-call bucket; the in-context
+# tool wrapper (``run_analysis``) drains it after the work completes and
+# re-emits each event through a logger the host does capture. ``to_thread``
+# copies the context, so the worker thread sees the same bucket object.
+_telemetry_bucket: contextvars.ContextVar[list | None] = contextvars.ContextVar(
+    "sandbox_telemetry_bucket", default=None
+)
+
+
+def new_telemetry_bucket() -> list:
+    """Start a fresh telemetry bucket for the current tool call and return it."""
+    bucket: list = []
+    _telemetry_bucket.set(bucket)
+    return bucket
+
+
+def _emit(evt: str, **fields) -> None:
+    """Record a sandbox-lifecycle event: log it locally and stash it so the
+    in-context tool wrapper can re-emit it to Application Insights."""
+    detail = " ".join(f"{k}={v}" for k, v in fields.items())
+    logger.info("%s %s", evt.upper(), detail)
+    bucket = _telemetry_bucket.get()
+    if bucket is not None:
+        bucket.append((evt, fields))
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -221,9 +251,15 @@ def _get_or_create_sandbox():
 
     if existing is not None:
         client = group.get_sandbox_client(existing.id)
+        prev_state = (existing.state or "").lower()
+        t0 = time.monotonic()
         client.ensure_running(timeout=300)
+        resume_ms = int((time.monotonic() - t0) * 1000)
+        _emit("sandbox_reuse", sandbox_id=client.sandbox_id,
+              prior_state=prev_state or "unknown", resume_ms=resume_ms)
         return client, False
 
+    t0 = time.monotonic()
     client = group.begin_create_sandbox(
         disk="ubuntu",
         cpu="1000m",
@@ -233,21 +269,33 @@ def _get_or_create_sandbox():
         labels=labels,
     ).result()
     client.ensure_running(timeout=300)
-    logger.info("SANDBOX CREATED sandbox_id=%s (persistent, warm)", client.sandbox_id)
+    create_ms = int((time.monotonic() - t0) * 1000)
+    _emit("sandbox_create", sandbox_id=client.sandbox_id, create_ms=create_ms)
+    t0 = time.monotonic()
     boot = client.exec(_BOOTSTRAP_COMMAND)
+    bootstrap_ms = int((time.monotonic() - t0) * 1000)
     if boot.exit_code not in (0, None):
         raise RuntimeError(
             "Sandbox bootstrap failed (could not install the data stack). "
             f"exit={boot.exit_code} stderr={(boot.stderr or '').strip()[:500]}"
         )
+    _emit("sandbox_bootstrap", sandbox_id=client.sandbox_id, bootstrap_ms=bootstrap_ms)
     return client, True
 
 
-def _exec_cell(client, code: str) -> str:
-    """Run one cell in the warm sandbox and return combined stdout/stderr text."""
+def _exec_cell(client, code: str, phase: str = "analysis") -> str:
+    """Run one cell in the warm sandbox and return combined stdout/stderr text.
+
+    ``phase`` (e.g. ``analysis`` for the agent's code, ``profile`` for the
+    schema-profiling cell) is logged so each sandbox exec can be inspected in
+    Application Insights: how long it ran, its exit code, and how much output
+    it produced.
+    """
     client.write_file(_RUNNER_FILE, _RUNNER_SOURCE, create_dirs=True)
     client.write_file(_CELL_FILE, code, create_dirs=True)
+    t0 = time.monotonic()
     result = client.exec(f"cd {_WORKDIR} && MPLBACKEND=Agg python3 {_RUNNER_FILE}")
+    exec_ms = int((time.monotonic() - t0) * 1000)
 
     parts: list[str] = []
     output = (result.stdout or "").rstrip()
@@ -256,8 +304,14 @@ def _exec_cell(client, code: str) -> str:
     stderr = (result.stderr or "").strip()
     if stderr:
         parts.append(f"[stderr]\n{stderr}")
+    exit_code = result.exit_code if result.exit_code is not None else 0
     if result.exit_code not in (0, None):
         parts.append(f"[exit code: {result.exit_code}]")
+
+    sandbox_id = getattr(client, "sandbox_id", "")
+    _emit("sandbox_exec", phase=phase, exit=exit_code, exec_ms=exec_ms,
+          code_bytes=len(code), out_bytes=len(output), had_stderr=bool(stderr),
+          sandbox_id=sandbox_id)
     return "\n".join(parts) if parts else "(no output)"
 
 
@@ -301,10 +355,8 @@ def _ensure_dataset_loaded(client) -> str:
         if prev == "no-data":
             return ""
         client.write_file(_ETAG_MARKER, "no-data", create_dirs=True)
-        logger.info(
-            "NO INPUT blob=%s/%s sandbox_id=%s",
-            _INPUT_CONTAINER, _INPUT_BLOB_NAME, client.sandbox_id,
-        )
+        _emit("no_input", blob=f"{_INPUT_CONTAINER}/{_INPUT_BLOB_NAME}",
+              sandbox_id=client.sandbox_id)
         return (
             f"[no input] Blob '{_INPUT_BLOB_NAME}' was not found in container "
             f"'{_INPUT_CONTAINER}', so there is no DataFrame to analyse this run. "
@@ -313,16 +365,16 @@ def _ensure_dataset_loaded(client) -> str:
 
     etag = (props.etag or "").strip('"')
     if etag and etag == prev:
+        _emit("dataset_reuse", blob=f"{_INPUT_CONTAINER}/{_INPUT_BLOB_NAME}",
+              etag=etag, sandbox_id=client.sandbox_id)
         return ""  # df already loaded for this version of the input
 
     csv_bytes = blob.download_blob().readall()
     client.write_file(_DATASET_FILE, csv_bytes, create_dirs=True)
     client.write_file(_ETAG_MARKER, etag or "loaded", create_dirs=True)
-    logger.info(
-        "DATASET LOADED blob=%s/%s bytes=%d sandbox_id=%s",
-        _INPUT_CONTAINER, _INPUT_BLOB_NAME, len(csv_bytes), client.sandbox_id,
-    )
-    profile = _exec_cell(client, _PROFILE_CELL)
+    _emit("dataset_load", blob=f"{_INPUT_CONTAINER}/{_INPUT_BLOB_NAME}",
+          bytes=len(csv_bytes), etag=etag, sandbox_id=client.sandbox_id)
+    profile = _exec_cell(client, _PROFILE_CELL, phase="profile")
     return (
         f"[dataset loaded] '{_INPUT_BLOB_NAME}' ({len(csv_bytes)} bytes) is available as the "
         f"DataFrame `df`.\n{profile}\n"
@@ -340,7 +392,7 @@ def run_analysis_sync(code: str) -> str:
     """
     client, _ = _get_or_create_sandbox()
     prefix = _ensure_dataset_loaded(client)
-    output = _exec_cell(client, code)
+    output = _exec_cell(client, code, phase="analysis")
     published = _maybe_publish(client)
     return f"{prefix}{output}{published}"
 
@@ -464,12 +516,8 @@ def _maybe_publish(client) -> str:
     # Clear the narrative so the dashboard is published exactly once per run.
     client.write_file(_BODY_FILE, "", create_dirs=True)
 
-    logger.info(
-        "DASHBOARD PUBLISHED container=%s blobs=%s sandbox_id=%s",
-        _OUTPUT_CONTAINER,
-        ",".join(uploaded),
-        client.sandbox_id,
-    )
+    _emit("dashboard_publish", container=_OUTPUT_CONTAINER, blobs=",".join(uploaded),
+          count=len(uploaded), had_chart=bool(chart_bytes), sandbox_id=client.sandbox_id)
     base = _BLOB_ENDPOINT.rstrip("/")
     urls = "\n".join(f"  - {base}/{_OUTPUT_CONTAINER}/{name}" for name in uploaded)
     note = (

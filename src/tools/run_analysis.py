@@ -11,10 +11,20 @@ agent never needs a separate load or publish tool.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from azure_functions_agents import tool
 
-from _analyst_common import run_analysis_sync
+from _analyst_common import new_telemetry_bucket, run_analysis_sync
+
+# The Functions host only captures logs bound to the active invocation context,
+# and ``run_analysis_sync`` runs off that context (under ``asyncio.to_thread``),
+# so its sandbox-lifecycle logs never reach Application Insights. We re-emit them
+# from the in-context async wrapper below. The logger name must NOT live under
+# the ``azure.functions.*`` namespace, which the Python worker suppresses from
+# user-log forwarding; ``sports_analytics.sandbox`` propagates to root and is
+# captured (same path as the agent_framework / openai logs that do flow).
+_telemetry_logger = logging.getLogger("sports_analytics.sandbox")
 
 
 @tool(
@@ -39,4 +49,13 @@ from _analyst_common import run_analysis_sync
     ),
 )
 async def run_analysis(code: str) -> str:
-    return await asyncio.to_thread(run_analysis_sync, code)
+    # ``to_thread`` copies the context, so the worker thread fills this same
+    # bucket; we drain it here (back in the captured invocation context) and
+    # re-emit each event so it lands in Application Insights.
+    bucket = new_telemetry_bucket()
+    try:
+        return await asyncio.to_thread(run_analysis_sync, code)
+    finally:
+        for evt, fields in bucket:
+            detail = " ".join(f"{k}={v}" for k, v in fields.items())
+            _telemetry_logger.info("SANDBOX evt=%s %s", evt, detail)

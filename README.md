@@ -208,6 +208,50 @@ curl -X POST "https://<functionApp>.azurewebsites.net/admin/functions/<timer-fun
 
 Open `output/dashboard.html` from the `output` container (download it from the portal, or generate a short-lived SAS link). It's a single self-contained file with the chart embedded — no hosting required. `chart.png` and `summary.csv` are written alongside it.
 
+### Inspect the sandbox calls (Application Insights)
+
+Every run emits a structured trace for each step the agent drives in the sandbox, so you can watch the work without opening the sandbox. The events land in the `traces` table with the message prefix `SANDBOX evt=`:
+
+| `evt` | Emitted when | Useful fields |
+| --- | --- | --- |
+| `sandbox_create` / `sandbox_bootstrap` | a cold sandbox is created and the data stack installed | `create_ms`, `bootstrap_ms` |
+| `sandbox_reuse` | a warm sandbox is resumed (the common case) | `prior_state`, `resume_ms` |
+| `dataset_load` / `dataset_reuse` | the CSV is loaded, or skipped because its ETag is unchanged | `bytes`, `etag` |
+| `sandbox_exec` | the agent runs a cell of pandas code | `phase` (`profile`/`analysis`), `exit`, `exec_ms`, `code_bytes`, `out_bytes`, `had_stderr` |
+| `dashboard_publish` | the dashboard is assembled and written to Blob Storage | `blobs`, `count`, `had_chart` |
+
+Parse and inspect them in the App Insights **Logs** blade (or `az monitor app-insights query`):
+
+```kusto
+traces
+| where message startswith "SANDBOX evt="
+| extend evt     = extract(@"evt=(\w+)", 1, message),
+         phase   = extract(@"phase=(\w+)", 1, message),
+         exec_ms = toint(extract(@"exec_ms=(\d+)", 1, message)),
+         sandbox = extract(@"sandbox_id=([\w-]+)", 1, message)
+| project timestamp, operation_Id, evt, phase, exec_ms, sandbox, message
+| order by timestamp asc
+```
+
+One row per run — call count, total sandbox compute time, and whether it ran warm (`reuses`) or cold (`creates`):
+
+```kusto
+traces
+| where message startswith "SANDBOX evt="
+| extend evt = extract(@"evt=(\w+)", 1, message),
+         exec_ms = toint(extract(@"exec_ms=(\d+)", 1, message))
+| summarize calls=countif(evt=="sandbox_exec"),
+            total_exec_ms=sum(exec_ms),
+            reuses=countif(evt=="sandbox_reuse"),
+            creates=countif(evt=="sandbox_create"),
+            loads=countif(evt=="dataset_load"),
+            published=countif(evt=="dashboard_publish")
+  by operation_Id, bin(timestamp, 1h)
+| order by timestamp desc
+```
+
+> The events are emitted from the in-context tool wrapper ([run_analysis.py](src/tools/run_analysis.py)) under the `sports_analytics.sandbox` logger so the Functions host forwards them to Application Insights. (Logs emitted from the `asyncio.to_thread` worker thread, or under the `azure.functions.*` namespace, are not captured.)
+
 ## Security & isolation
 
 - **The sandbox holds no credentials.** Only the CSV goes in and only results (text, a PNG, a summary CSV) come out. There is no managed identity inside the sandbox.
@@ -219,4 +263,4 @@ Open `output/dashboard.html` from the `output` container (download it from the p
 
 - The sandbox **auto-suspends** when idle (state preserved on disk) and resumes on the next run, so you only pay for active compute while keeping the warm-start benefit.
 - This app uses a **custom** sandbox tool, not the `dynamic_sessions_code_interpreter` system tool, because it needs to move a file (the CSV) in and pull artifacts (the chart) out, and to keep one sandbox warm across scheduled runs.
-- Sandbox lifecycle (`SANDBOX CREATED`, `DATASET LOADED`, `DASHBOARD PUBLISHED`) is logged to Application Insights `traces` for live visibility during a demo.
+- Sandbox lifecycle (`sandbox_create`, `sandbox_reuse`, `dataset_load`, `sandbox_exec`, `dashboard_publish`) is logged to Application Insights `traces` for live visibility during a demo — see [Inspect the sandbox calls](#inspect-the-sandbox-calls-application-insights).
