@@ -145,6 +145,7 @@ sports-analytics-agent/
 ├── azure.yaml                     # azd service definition
 ├── sample-data/
 │   └── matches.csv                # synthetic women's cricket world cup stats (seed the input container)
+├── sample-output/                 # example artifacts from a live run (dashboard.html, chart.png, summary.csv)
 ├── infra/                         # Bicep: Functions, Foundry, sandbox group, Blob, RBAC
 │   ├── main.bicep
 │   ├── main.parameters.json
